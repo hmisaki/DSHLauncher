@@ -1,6 +1,15 @@
-# DSH 备份 / 恢复工具（桌面版）
+# DSHLuncher — 桌面版整包备份 / 一键回滚
 
-给 DSH 做**整包快照**的桌面工具：不占端口、不要浏览器、不装数据库。把「昨天改坏了想回退」从「不知道动过什么」变成「选一个时间点，点恢复」。
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
+![Dependencies](https://img.shields.io/badge/deps-PySide6%20%2B%207z-green)
+
+给**会把自己改坏的本地工程**做整包快照的桌面工具：不占端口、不要浏览器、不装数据库、不引入去重链。
+
+把「昨天改坏了想回退」从「不知道动过什么」变成「选一个时间点，点恢复」。
+
+本来是为 DeepSeek Harness（本地 AI agent 运行时）写的：要备 harness 源码 + 用户配置 + 会话日志 + 工作区四类。但四类的定义全在 `config.json` 里，换成任何「源码目录 + 配置目录 + 数据目录」的组合都能直接用。
 
 ![主界面](docs/screenshots/main.png)
 
@@ -163,4 +172,6 @@ python -m unittest discover -s tests
 
 ## 9. 许可
 
-私有工具，未附许可协议。
+MIT，见 [LICENSE](LICENSE)。随便用、随便改、随便商用，出问题别找我。
+
+如果它对你有用，点个 ⭐ 就够了。
