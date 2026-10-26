@@ -1,4 +1,4 @@
-# DSHLuncher — 桌面版整包备份 / 一键回滚
+# DSHLauncher — 桌面版整包备份 / 一键回滚
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -24,8 +24,8 @@
 ## 1. 跑起来
 
 ```bat
-git clone <this-repo> DSHLuncher
-cd DSHLuncher
+git clone <this-repo> DSHLauncher
+cd DSHLauncher
 pip install PySide6
 启动.cmd
 ```
@@ -133,7 +133,7 @@ MCP（`mcp_server.py`，stdio）：
 ## 7. 目录
 
 ```
-DSHLuncher\
+DSHLauncher\
 ├─ launcher.py            入口：校验配置、开窗口
 ├─ mcp_server.py          MCP 服务（stdio）
 ├─ config.example.json    配置模板（复制成 data\config.json 后改）
@@ -154,7 +154,7 @@ DSHLuncher\
 跑测试：
 
 ```bat
-cd DSHLuncher
+cd DSHLauncher
 python -m unittest discover -s tests
 ```
 
