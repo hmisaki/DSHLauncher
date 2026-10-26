@@ -9,6 +9,8 @@
 
 把「昨天改坏了想回退」从「不知道动过什么」变成「选一个时间点，点恢复」。
 
+> **English TL;DR** — A Windows desktop app that snapshots a local project into **complete, independent 7z archives** (no incremental or dedup chains — lose one, lose only that one), prunes them with a sparse retention policy that keeps the oldest, and restores with **file-by-file verification**. Four backup classes (source / config / sessions / workspace), an interactive timeline, and a stdio MCP server so an AI agent can drive it. Python + PySide6, backend is just `7z.exe` and `robocopy`. No server, no database, no browser.
+
 本来是为 DeepSeek Harness（本地 AI agent 运行时）写的：要备 harness 源码 + 用户配置 + 会话日志 + 工作区四类。但四类的定义全在 `config.json` 里，换成任何「源码目录 + 配置目录 + 数据目录」的组合都能直接用。
 
 ![主界面](docs/screenshots/main.png)
