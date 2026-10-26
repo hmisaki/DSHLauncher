@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSH 备份</title>
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<header>
+  <h1>DSH 备份</h1>
+  <div class="health" id="health"><span class="dot"></span><span id="healthText">检查中…</span></div>
+</header>
+
+<div class="meta" id="meta">—</div>
+
+<section class="card" id="layersCard">
+  <table class="layers">
+    <thead>
+      <tr><th>块</th><th>最新一份</th><th class="num">份数</th><th class="num">占用</th><th>覆盖到</th><th></th></tr>
+    </thead>
+    <tbody id="layersBody">
+      <tr><td colspan="6" class="muted">加载中…</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="actions">
+  <button id="btnRestore" class="primary">恢复…</button>
+  <button id="btnMilestone">打里程碑…</button>
+  <span class="sep"></span>
+  <button id="btnStart">启动环境</button>
+  <button id="btnRestart">重启环境</button>
+  <button id="btnStop" class="danger">关闭环境</button>
+</section>
+
+<section class="card">
+  <div class="cardHead">
+    <span>对话层最近 8 份</span>
+    <button class="link" id="btnAllSlots">全部份</button>
+  </div>
+  <table class="slots">
+    <thead><tr><th>年龄</th><th class="num">大小</th><th>校验</th><th>档位</th><th></th></tr></thead>
+    <tbody id="slotsBody"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+  </table>
+</section>
+
+<details class="card" id="cfgDetails">
+  <summary>配置（端口 / 路径 / 策略）</summary>
+  <div class="cfgBody">
+    <div class="cfgRow"><label>DSH 端口</label><input id="portDsh" type="number" min="1" max="65535"></div>
+    <div class="cfgRow"><label>面板端口</label><input id="portApi" type="number" min="1" max="65535"></div>
+    <div class="cfgRow"><label>备份根目录</label><input id="cfgRoot" type="text"></div>
+    <div class="cfgRow"><label>对话层间隔（分钟）</label><input id="cfgEvery" type="number" min="1"></div>
+    <div class="cfgRow"><label>基线时刻</label><input id="cfgAt" type="text" placeholder="04:00"></div>
+    <div class="cfgRow check"><label><input id="cfgPaused" type="checkbox"> 暂停自动备份（总闸）</label></div>
+    <div class="cfgRow"><button id="btnSaveCfg" class="primary">保存配置</button>
+      <button id="btnCheckCfg" class="link">校验</button></div>
+    <div id="cfgMsg" class="muted small"></div>
+  </div>
+</details>
+
+<details class="card" id="manualDetails">
+  <summary>怎么手工恢复（不用这个面板也能做）</summary>
+  <pre class="mono" id="manualText">加载中…</pre>
+</details>
+
+<div id="progress" class="progressbar" hidden>
+  <div class="bar"><div class="fill" id="progFill"></div></div>
+  <div class="progText" id="progText"></div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<!-- 恢复确认 overlay（S2） -->
+<div id="restoreModal" class="modal" hidden>
+  <div class="modalBox">
+    <h2>恢复</h2>
+    <div id="restorePick" class="muted small">选一份要恢复的包</div>
+    <select id="restoreSlot" size="8" class="slotPick"></select>
+    <div class="modalRow">
+      <label><input type="checkbox" id="restoreDrill" checked> 只演练（解到临时目录，不动真机）</label>
+    </div>
+    <div class="modalRow">
+      <label>还原范围</label>
+      <select id="restoreTargets">
+        <option value="">整包</option>
+        <option value=".dsh">只 .dsh</option>
+        <option value="deepseek-harness">只 deepseek-harness</option>
+        <option value="WorkSpace">只 WorkSpace</option>
+      </select>
+    </div>
+    <div id="restorePrecheck" class="precheck muted small">选一份后会先做预检（包在不在、sha 对不对、网关在不在跑）</div>
+    <div class="modalRow right">
+      <button id="btnRestoreCancel" class="link">取消</button>
+      <button id="btnRestoreGo" class="primary">开始</button>
+    </div>
+  </div>
+</div>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

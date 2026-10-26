@@ -1,0 +1,33 @@
+# ---- 备份库：跑起来就会生成，几百 MB 到几 GB，绝不入库 ----
+data/
+
+# ---- 开发过程记录：审计报告、走查、旧版截图。
+# 里面带着写它们时的本机路径，对使用者没价值，留在本地即可。
+docs/archive/
+docs/shots/
+
+# ---- 运行期临时产物 ----
+tmp/
+*.tmp
+
+# ---- 就地改代码留下的备份 ----
+*.bak
+*.bak-*
+*.orig
+*.rej
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
