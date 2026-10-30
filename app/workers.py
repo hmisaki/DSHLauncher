@@ -1,27 +1,23 @@
-"""后台任务线程：把 engine 的阻塞调用挪出 UI 线程。"""
 from __future__ import annotations
 
-import traceback
-from typing import Callable
+from typing import Callable, Any
 
 from PySide6.QtCore import QThread, Signal
 
+from dshbackup.engine import Progress
 
-class Job(QThread):
-    """跑一个可调用对象，结束时把结果（或异常文本）发回主线程。"""
 
-    finished_ok = Signal(dict)
+class JobThread(QThread):
+    completed = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, fn: Callable[..., dict], *args, **kwargs) -> None:
-        super().__init__()
-        self._fn = fn
-        self._args = args
-        self._kwargs = kwargs
+    def __init__(self, operation: Callable[[Progress], Any], parent=None) -> None:
+        super().__init__(parent)
+        self.operation = operation
+        self.progress = Progress()
 
-    def run(self) -> None:  # noqa: D102
+    def run(self) -> None:
         try:
-            res = self._fn(*self._args, **self._kwargs)
-            self.finished_ok.emit(res if isinstance(res, dict) else {"ok": True, "result": res})
+            self.completed.emit(self.operation(self.progress))
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"{exc}\n{traceback.format_exc(limit=5)}")
+            self.failed.emit(f"{type(exc).__name__}: {exc}")

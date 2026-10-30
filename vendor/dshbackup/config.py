@@ -107,7 +107,9 @@ DEFAULTS: dict = {
                 {
                     "label": "dsh",
                     "path": "{dsh_home}",
-                    "exclude_dirs": ["sessions", "voicebox-cache"],
+                    # service-manager 里只有服务定义与运行期日志；日志被运行中的服务
+                    # 独占，7z 打不开会返回 1（warning），整块基线因此被判失败。
+                    "exclude_dirs": ["sessions", "voicebox-cache", "service-manager"],
                 },
             ],
             # junction 必须按精确路径排；用通配会把同名真目录一起排掉（踩过）
@@ -141,6 +143,9 @@ DEFAULTS: dict = {
         KIND_BASELINE: {
             "enabled": True,
             "method": "7z",
+            # 先复制到 slot 暂存目录，再压缩；文件被短暂占用时能明确报告跳过项，
+            # 避免 7z 在源目录变化时生成只有部分文件的基线包。
+            "stage_copy": True,
             "at": "03:30",
             "c": 720,
             "D": 1440,

@@ -121,6 +121,10 @@ class Progress:
             if phase is not None:
                 self._s["phase"] = phase
 
+    def stage(self, message: str) -> None:
+        """切换到一个不按百分比计量的收尾步骤。"""
+        self.update(detail=str(message), phase=str(message))
+
     def finish(self, message: str = "", ok: bool = True) -> None:
         with self._lock:
             self._s["busy"] = False
@@ -136,6 +140,7 @@ class Progress:
 # ---------------- 扫描统计 ----------------
 
 def count_tree(root: str | Path, exclude_dirs: list[str],
+               exclude_paths: list[str] | None = None,
                on_progress=None, every: int = 2000) -> tuple[int, int]:
     """统计 root 下文件数与字节。
 
@@ -150,18 +155,24 @@ def count_tree(root: str | Path, exclude_dirs: list[str],
     files = 0
     size = 0
     excl_names = {str(d).lower() for d in (exclude_dirs or [])}
+    excl_paths = {os.path.normcase(os.path.abspath(str(p))) for p in (exclude_paths or [])}
     for cur, dirnames, filenames in os.walk(root, followlinks=False):
         curp = Path(cur)
         kept = []
         for d in dirnames:
-            if d.lower() in excl_names:
+            child = curp / d
+            key = os.path.normcase(os.path.abspath(str(child)))
+            if d.lower() in excl_names or key in excl_paths:
                 continue
-            if sevenzip.is_link(curp / d):
+            if sevenzip.is_link(child):
                 continue
             kept.append(d)
         dirnames[:] = kept
         for f in filenames:
             fp = curp / f
+            key = os.path.normcase(os.path.abspath(str(fp)))
+            if key in excl_paths or sevenzip.is_link(fp):
+                continue
             try:
                 st = fp.stat(follow_symlinks=False)
             except OSError:
@@ -213,6 +224,7 @@ def mirror_store(cfg: dict, root: Path, progress: Progress | None = None,
 # ---------------- 7z 类备份 ----------------
 
 def _copy_for_pack(src: Path, dst: Path, exclude_dirs: list[str],
+                   exclude_paths: list[str] | None = None,
                    on_progress=None) -> tuple[int, int, int]:
     """把源目录整棵复制到 dst，供 7z 压缩。
 
@@ -228,16 +240,26 @@ def _copy_for_pack(src: Path, dst: Path, exclude_dirs: list[str],
     """
     dst.mkdir(parents=True, exist_ok=True)
     excl = {d.lower() for d in exclude_dirs}
+    excl_paths = {os.path.normcase(os.path.abspath(str(p))) for p in (exclude_paths or [])}
+
+    def excluded(path: Path) -> bool:
+        return os.path.normcase(os.path.abspath(str(path))) in excl_paths
+
     files = 0
     total = 0
     skipped = 0
     for dirpath, dirnames, filenames in os.walk(src):
-        dirnames[:] = [d for d in dirnames if d.lower() not in excl]
+        cur = Path(dirpath)
+        dirnames[:] = [d for d in dirnames
+                       if d.lower() not in excl and not excluded(cur / d)
+                       and not sevenzip.is_link(cur / d)]
         rel = os.path.relpath(dirpath, src)
         target_dir = dst if rel == "." else (dst / rel)
         target_dir.mkdir(parents=True, exist_ok=True)
         for fn in filenames:
             sp = Path(dirpath) / fn
+            if excluded(sp) or sevenzip.is_link(sp):
+                continue
             tp = target_dir / fn
             try:
                 shutil.copy2(sp, tp)
@@ -271,6 +293,13 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
         return {"ok": False, "reason": f"磁盘余量不足 {free:.1f} GB"}
 
     roots = cfgmod.resolve_sets(cfg, kind)
+    # 空路径必须单独判：Path("") 在 Windows 上 exists() 返回 True，
+    # 会一路走到 7z 把当前盘根当源压进去（2026-10-28 实际发生过，打出一个 2.8 GB 的假 harness 包）。
+    blank = [r["label"] for r in roots if not str(r.get("path") or "").strip()]
+    if blank:
+        return {"ok": False,
+                "reason": "配置里的源路径为空：" + ", ".join(blank)
+                          + "（检查 config.json 的 paths.checkout / paths.workspace）"}
     missing = [r["path"] for r in roots if not Path(r["path"]).exists()]
     if missing:
         return {"ok": False, "reason": "源不存在：" + ", ".join(missing)}
@@ -314,7 +343,10 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
                         detail=f"{label}: 已扫到 {files:,} 个文件 / {human_bytes(size)}",
                     )
 
-            src_files, src_bytes = count_tree(r["path"], r["exclude_dirs"], on_progress=scan_prog)
+            src_files, src_bytes = count_tree(
+                r["path"], r["exclude_dirs"], exclude_paths=exclude_links + auto_links,
+                on_progress=scan_prog,
+            )
             stats.append((r, src_files, src_bytes))
 
         total_files = sum(s[1] for s in stats)
@@ -355,15 +387,26 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
         )
         verified = False
         err = ""
+        archive_files = None
         if pack.ok:
             if progress:
                 progress.update(phase="校验中（单包）", detail="7z t 逐字节校验")
             t = sevenzip.test_7z(cfg, archive)
-            verified = t.ok
-            if not t.ok:
+            if t.ok:
+                info = sevenzip.archive_info(cfg, archive)
+                archive_files = info.get("files")
+                if not info.get("ok"):
+                    err = "无法读取归档文件数：" + (info.get("error") or "7z l 未返回统计")
+                elif archive_files != total_files:
+                    err = (f"归档完整性不符：源目录扫描到 {total_files:,} 个文件，"
+                           f"归档实际只有 {archive_files:,} 个；请关闭占用文件的程序后重试。")
+                else:
+                    verified = True
+            else:
                 err = "7z t 校验失败：" + (t.error or t.tail_text[-200:])
         else:
-            err = pack.error or pack.tail_text[-400:]
+            err = (f"7z 压缩退出码 {pack.code}（警告或失败）："
+                   + (pack.error or pack.tail_text[-400:]))
 
         sha = manifest.file_sha256(archive) if archive.exists() else ""
         for r, src_files, src_bytes in stats:
@@ -383,6 +426,8 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
                 "files": src_files,
                 "verifiedOk": verified,
             }
+            if archive_files is not None:
+                part["archiveFilesTotal"] = archive_files
             if not pack.ok:
                 part["error"] = err
                 if getattr(pack, "disk_full", False):
@@ -408,7 +453,10 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
                         detail=f"{label}: 已扫到 {files:,} 个文件 / {human_bytes(size)}",
                     )
 
-            src_files, src_bytes = count_tree(r["path"], r["exclude_dirs"], on_progress=scan_prog)
+            src_files, src_bytes = count_tree(
+                r["path"], r["exclude_dirs"], exclude_paths=exclude_links + auto_links,
+                on_progress=scan_prog,
+            )
             archive = folder / f"{r['label']}.7z"
 
             # stage_copy：先把源复制到 slot 里的 _staging，再压这一份。
@@ -435,7 +483,8 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
                         )
 
                 cf, cb, copy_skipped = _copy_for_pack(
-                    Path(r["path"]), staging_dir, r["exclude_dirs"], on_progress=copy_prog
+                    Path(r["path"]), staging_dir, r["exclude_dirs"],
+                    exclude_paths=exclude_links + auto_links, on_progress=copy_prog,
                 )
                 pack_src = str(staging_dir)
                 pack_excl_dirs = []
@@ -495,7 +544,8 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
                 "verifiedOk": False,
             }
             if not pack.ok:
-                part["error"] = pack.error or pack.tail_text[-400:]
+                part["error"] = (f"7z 压缩退出码 {pack.code}（警告或失败）："
+                                  + (pack.error or pack.tail_text[-400:]))
                 if getattr(pack, "disk_full", False):
                     # 体检 E：磁盘满是一个「你能自己解决」的原因，不能只说「失败了」
                     part["diskFull"] = True
@@ -505,8 +555,19 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
                     progress.update(phase=f"校验中（{r['label']}）",
                                     detail=f"{r['label']}: 7z t 逐字节校验")
                 t = sevenzip.test_7z(cfg, archive)
-                part["verifiedOk"] = t.ok
-                if not t.ok:
+                if t.ok:
+                    info = sevenzip.archive_info(cfg, archive)
+                    part["archiveFiles"] = info.get("files")
+                    if not info.get("ok"):
+                        part["error"] = "无法读取归档文件数：" + (info.get("error") or "7z l 未返回统计")
+                    elif info["files"] != src_files:
+                        part["error"] = (
+                            f"归档完整性不符：源目录扫描到 {src_files:,} 个文件，"
+                            f"归档实际只有 {info['files']:,} 个；请关闭占用文件的程序后重试。"
+                        )
+                    else:
+                        part["verifiedOk"] = True
+                else:
                     part["error"] = "7z t 校验失败：" + (t.error or t.tail_text[-200:])
                 part["sha256"] = manifest.file_sha256(archive)
             if staging_dir is not None and staging_dir.exists():
@@ -517,6 +578,9 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
                     pass
             if copy_skipped:
                 part["copySkipped"] = copy_skipped
+                part["verifiedOk"] = False
+                skipped_detail = f"复制阶段有 {copy_skipped} 个文件无法读取，归档不完整。"
+                part["error"] = f"{part['error']}\n{skipped_detail}" if part.get("error") else skipped_detail
             parts.append(part)
 
     manifest.write_link_lists(folder, links, empties)
@@ -532,6 +596,10 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
         logger.info(
             "run_done", kind=kind, slot=slot["slot"], ok=ok,
             files=slot["files"], bytes=slot["bytes"], links=len(links),
+            parts=[{key: p.get(key) for key in
+                    ("label", "ok", "sourceFiles", "archiveFiles", "archiveFilesTotal",
+                     "verifiedOk", "copySkipped", "error")}
+                   for p in parts],
         )
 
     pruned = None
@@ -544,9 +612,11 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
             # 体检 E：进度条那句也得说人话，不然用户只看到「失败」
             progress.finish("磁盘空间不够，这次没存成", False)
         else:
+            first_error = next((p.get("error") for p in parts if p.get("error")), "")
             progress.finish(
-                f"{cfgmod.kind_label(kind)} 完成：{len(parts)} 个包 / {human_bytes(slot['bytes'])}"
-                + (f"；淘汰 {pruned['deleted']} 份" if pruned and pruned.get("deleted") else ""),
+                (f"{cfgmod.kind_label(kind)} 完成：{len(parts)} 个包 / {human_bytes(slot['bytes'])}"
+                 + (f"；淘汰 {pruned['deleted']} 份" if pruned and pruned.get("deleted") else "")
+                 if ok else f"{cfgmod.kind_label(kind)} 备份未通过完整性校验：{first_error or '请查看日志'}"),
                 ok,
             )
     # 单包模式下多个源共享同一个归档，耗时也不能按源累加
@@ -554,10 +624,12 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
     for _p in parts:
         _sec_by_arch.setdefault(str(_p.get("zipPath") or _p["label"]), _p.get("seconds", 0))
 
+    first_error = next((p.get("error") for p in parts if p.get("error")), "")
     return {
         "ok": ok,
         "diskFull": any(p.get("diskFull") for p in parts),
-        "reason": "磁盘空间不够，没写成" if any(p.get("diskFull") for p in parts) else "",
+        "reason": ("磁盘空间不够，没写成" if any(p.get("diskFull") for p in parts)
+                   else first_error),
         "slot": slot["slot"],
         "dir": str(folder),
         "files": slot["files"],
@@ -572,6 +644,8 @@ def backup_kind(cfg: dict, root: Path, kind: str, *, note: str = "",
         "parts": [
             {"label": p["label"], "bytes": p["bytes"], "verifiedOk": p.get("verifiedOk"),
              "seconds": p.get("seconds"), "zipName": p.get("zipName"),
+             "sourceFiles": p.get("sourceFiles"), "archiveFiles": p.get("archiveFiles"),
+             "error": p.get("error"),
              "zipPath": p.get("zipPath"), "arcName": p.get("arcName"),
              "singleArchive": p.get("singleArchive")}
             for p in parts
@@ -639,7 +713,8 @@ def _role_new_root(kind: str, label: str, roots: dict) -> Path | None:
     return None
 
 
-def _relocate_path(path: str, cfg: dict, kind: str, roots: dict) -> Path | None:
+def _relocate_path(path: str, cfg: dict, kind: str, roots: dict, *,
+                   only_kind: bool = False) -> Path | None:
     """把「原根下的绝对路径」改写成「新根 + 相对路径」；不在任何根下就返回 None。
 
     junction 的目标常常带 ``\\\\?\\`` 这种长路径前缀，先剥掉再比，否则永远匹配不上祖根。
@@ -648,14 +723,20 @@ def _relocate_path(path: str, cfg: dict, kind: str, roots: dict) -> Path | None:
     if raw.startswith("\\\\?\\"):
         raw = raw[4:]
     p = Path(raw)
-    for r in cfgmod.resolve_sets(cfg, kind):
-        try:
-            sub = p.relative_to(Path(r["path"]))
-        except ValueError:
-            continue
-        new_root = _role_new_root(kind, r["label"], roots)
-        if new_root is not None:
-            return new_root / sub
+    kinds = [kind]
+    if not only_kind:
+        for candidate in (cfgmod.KIND_BASELINE, cfgmod.KIND_SESSIONS, cfgmod.KIND_WORKSPACE):
+            if candidate not in kinds:
+                kinds.append(candidate)
+    for candidate in kinds:
+        for r in cfgmod.resolve_sets(cfg, candidate):
+            try:
+                sub = p.relative_to(Path(r["path"]))
+            except ValueError:
+                continue
+            new_root = _role_new_root(candidate, r["label"], roots)
+            if new_root is not None:
+                return new_root / sub
     return None
 
 
@@ -706,7 +787,12 @@ def write_links_script(folder: Path, links: list[dict], *,
             "",
         ]
     for l in links:
-        lines.append(f'mklink /J "{_strip_long(l["link"])}" "{_strip_long(l["target"])}"')
+        link = _strip_long(l["link"])
+        target = _strip_long(l["target"])
+        # 可重复执行：旧 junction 用 rmdir 删除的是链接本身，不会递归删除目标；
+        # 普通非空目录的 rmdir 会失败，因此不会清掉用户文件。
+        lines.append(f'if exist "{link}" rmdir "{link}" >nul 2>&1')
+        lines.append(f'mklink /J "{link}" "{target}"')
     lines += ["", "echo done.", 'if not "%~1"=="-y" pause', ""]
     script.write_text("\r\n".join(lines), encoding="gbk", errors="replace")
     return script
@@ -760,7 +846,7 @@ echo [DSH] checkout : %ROOT%
 if defined DSH_HOME echo [DSH] DSH_HOME : %DSH_HOME%
 echo [DSH] Close this window to stop the gateway.
 echo.
-call "%PNPM%" dsh web %TRUST%
+call "%PNPM%" dsh web --port 3080 %TRUST%
 set "RC=%ERRORLEVEL%"
 echo.
 echo [DSH] gateway exited with code %RC%.
@@ -786,11 +872,12 @@ exit /b 1
 """
 
 
-def make_launcher(harness: str | Path) -> Path:
+def make_launcher(harness: str | Path, port: int = 3080) -> Path:
     """在 harness 根写一份 start-dsh.cmd（全部 %~dp0 相对定位）。"""
     harness = Path(harness)
     script = harness / LAUNCHER_NAME
-    script.write_text(_LAUNCHER_BODY.replace("\n", "\r\n"), encoding="gbk", errors="replace")
+    body = _LAUNCHER_BODY.replace("3080", str(int(port)))
+    script.write_text(body.replace("\n", "\r\n"), encoding="gbk", errors="replace")
     return script
 
 
@@ -798,8 +885,59 @@ def _pnpm_exe() -> Path:
     return Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))) / "npm" / "pnpm.cmd"
 
 
+def store_path_for_checkout(cfg: dict, checkout: str | Path) -> Path | None:
+    """把当前 pnpm store 相同的盘符相对路径映射到目标 Harness 所在盘。"""
+    configured = str((cfg.get("paths") or {}).get("pnpm_store") or "").strip()
+    if not configured:
+        return None
+    source = Path(configured).expanduser()
+    target = Path(checkout).expanduser()
+    if not source.is_absolute() or not source.anchor or not target.anchor:
+        return source
+    if os.path.normcase(source.anchor) == os.path.normcase(target.anchor):
+        return source
+    try:
+        return Path(target.anchor) / source.relative_to(source.anchor)
+    except ValueError:
+        return source
+
+
+def _seed_local_store(cfg: dict, backup_root: Path, target: Path,
+                      progress=None, logger=None) -> dict:
+    """从固定的 store 镜像增量填充目标盘的 pnpm 本地仓库。"""
+    mirror = manifest.mirror_slot(backup_root)
+    source = Path(backup_root) / cfgmod.KIND_STORE
+    if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(target)):
+        return {"ok": True, "copied": False, "source": str(source), "dest": str(target)}
+    if not mirror or not mirror.get("onDisk") or not mirror.get("verifiedOk"):
+        return {"ok": False, "copied": False, "source": str(source),
+                "dest": str(target), "reason": "备份库中没有可用的 pnpm store 镜像"}
+
+    if progress:
+        progress.stage(f"复制 pnpm store 到目标盘：{target}")
+    copied = sevenzip.mirror_dir(
+        cfg, source, target,
+        on_progress=lambda count, line: progress and progress.update(
+            phase="复制 pnpm store", detail=line or f"已处理 {count:,} 个文件",
+        ),
+    )
+    files, size = count_tree(target, [])
+    expected = int(mirror.get("files") or 0)
+    ok = copied.ok and files >= expected * 0.99
+    result = {"ok": ok, "copied": True, "source": str(source), "dest": str(target),
+              "files": files, "bytes": size, "expectedFiles": expected,
+              "code": copied.code, "seconds": round(copied.seconds, 1)}
+    if logger:
+        (logger.info if ok else logger.warn)("restore_store_seed", **result)
+    if progress:
+        progress.update(phase="pnpm store 已准备好" if ok else "pnpm store 复制未完整",
+                        detail=f"{files:,} / {expected:,} 个文件 · {human_bytes(size)}")
+    return result
+
+
 def finish_restore(cfg: dict, out: dict, *, do_install: bool = True,
                    do_links: bool = True, cleanup: bool = True,
+                   backup_root: Path | None = None,
                    logger=None, progress=None) -> dict:
     """恢复后的收尾，让它「开包即用」。
 
@@ -823,31 +961,51 @@ def finish_restore(cfg: dict, out: dict, *, do_install: bool = True,
     if harness is None or not (harness / "package.json").exists():
         harness = None
 
-    store = (cfg.get("paths") or {}).get("pnpm_store") or ""
+    store_path = store_path_for_checkout(cfg, harness) if harness is not None else None
+    store = str(store_path or "")
     pnpm = _pnpm_exe()
 
+    if do_install and harness is not None and store_path is not None:
+        source_store = Path(str((cfg.get("paths") or {}).get("pnpm_store") or ""))
+        same_as_source = os.path.normcase(os.path.abspath(source_store)) == os.path.normcase(os.path.abspath(store_path))
+        if backup_root is not None and (not store_path.exists() or not same_as_source):
+            res["storeSync"] = _seed_local_store(cfg, Path(backup_root), store_path,
+                                                progress=progress, logger=logger)
+        elif store_path.exists():
+            res["storeSync"] = {"ok": True, "copied": False,
+                                "source": str(store_path), "dest": str(store_path)}
+        else:
+            res["storeSync"] = {"ok": False, "copied": False,
+                                "source": str(source_store), "dest": str(store_path),
+                                "reason": "目标盘没有 store，且没有可用的 store 镜像"}
+
     if do_install and harness is not None and pnpm.exists():
-        cmd = [str(pnpm), "install", "--offline", "--frozen-lockfile"]
-        if store:
-            cmd += ["--store-dir", store]
-        if progress:
-            progress.stage("正在装依赖（离线，store 里有的不下载）…")
-        t0 = time.time()
-        try:
-            cp = subprocess.run(cmd, cwd=str(harness), capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=7200,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            tail = ((cp.stdout or "") + (cp.stderr or "")).strip().splitlines()
-            res["install"] = {
-                "ok": cp.returncode == 0,
-                "code": cp.returncode,
-                "seconds": round(time.time() - t0, 1),
-                "tail": "\n".join(tail[-6:]),
-            }
-        except Exception as exc:                                  # noqa: BLE001
-            res["install"] = {"ok": False, "code": -1,
-                              "seconds": round(time.time() - t0, 1),
-                              "tail": f"{type(exc).__name__}: {exc}"}
+        store_sync = res.get("storeSync")
+        if store_sync and not store_sync.get("ok"):
+            res["install"] = {"ok": False, "code": -1, "seconds": 0,
+                              "tail": store_sync.get("reason") or "pnpm store 未准备好，跳过离线安装"}
+        else:
+            cmd = [str(pnpm), "install", "--offline", "--frozen-lockfile"]
+            if store:
+                cmd += ["--store-dir", store]
+            if progress:
+                progress.stage(f"正在使用 {store or 'pnpm 本地 store'} 离线安装依赖…")
+            t0 = time.time()
+            try:
+                cp = subprocess.run(cmd, cwd=str(harness), capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=7200,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                tail = ((cp.stdout or "") + (cp.stderr or "")).strip().splitlines()
+                res["install"] = {
+                    "ok": cp.returncode == 0,
+                    "code": cp.returncode,
+                    "seconds": round(time.time() - t0, 1),
+                    "tail": "\n".join(tail[-6:]),
+                }
+            except Exception as exc:                                  # noqa: BLE001
+                res["install"] = {"ok": False, "code": -1,
+                                  "seconds": round(time.time() - t0, 1),
+                                  "tail": f"{type(exc).__name__}: {exc}"}
         if logger:
             logger.info("restore_install", ok=res["install"]["ok"],
                         code=res["install"]["code"], seconds=res["install"]["seconds"])
@@ -876,26 +1034,15 @@ def finish_restore(cfg: dict, out: dict, *, do_install: bool = True,
                             failed=res["links"]["failedLines"])
 
     if harness is not None:
-        # 正本启动器住在 harness 根（相对定位），包里带着它就不用再生成。
-        #   新包：start.cmd（正本）+ DSH-restart.cmd（重启脚本）
-        #   旧包：DSH.cmd（那时的名字）
-        #   更老的包：两者都没有，才补写 start-dsh.cmd 兜底
-        pack_launcher = None
-        for _name in ("start.cmd", "DSH.cmd"):
-            _cand = harness / _name
-            if _cand.exists():
-                pack_launcher = _cand
-                break
-        if pack_launcher is not None:
-            res["launcher"] = str(pack_launcher)
-            res["launcherSource"] = "pack"
-        else:
-            try:
-                res["launcher"] = str(make_launcher(harness))
-                res["launcherSource"] = "generated"
-            except Exception as exc:                              # noqa: BLE001
-                res["launcher"] = f"（写启动器失败：{exc}）"
-                res["launcherSource"] = "failed"
+        # DSHLuncher2 部署的是独立环境：包内 start.cmd 可能仍然写着旧端口，
+        # 因此始终生成一个相对定位、显式使用当前配置端口的启动入口。
+        try:
+            port = int((cfg.get("ports") or {}).get("dsh", 3080) or 3080)
+            res["launcher"] = str(make_launcher(harness, port=port))
+            res["launcherSource"] = "generated"
+        except Exception as exc:                                  # noqa: BLE001
+            res["launcher"] = f"（写启动器失败：{exc}）"
+            res["launcherSource"] = "failed"
 
     if cleanup:
         # 只删「跑一遍就没用」的收尾脚本：restore-links.cmd、restore-links 留下的临时件。
@@ -1024,6 +1171,23 @@ def restore_slot(cfg: dict, root: Path, kind: str, slot_id: str, *,
     reloc = bool(roots)
     drill = (dest is not None) and not reloc
     base_dest = Path(dest) if drill else None
+    relocation_targets: dict[str, dict] = {}
+    if reloc:
+        # 先检查所有落点，再解第一个包；否则第二个目标不合格时，第一个可能已经写了一半。
+        for p in parts:
+            got = _role_new_root(kind, p["label"], roots)
+            if got is None:
+                return {"ok": False,
+                        "reason": f"没有给「{p['label']}」指定新位置（要 harness / dsh / workspace）"}
+            target = Path(got)
+            if sevenzip.is_link(target):
+                return {"ok": False, "reason": f"部署目标不能是 junction 或符号链接：{target}"}
+            if target.exists() and not target.is_dir():
+                return {"ok": False, "reason": f"部署目标已存在但不是目录：{target}"}
+            if target.exists() and any(target.iterdir()):
+                return {"ok": False,
+                        "reason": f"目标目录不是空的：{target}\n落到别处要求目标为空目录，换一个位置。"}
+            relocation_targets[str(target)] = {"path": target, "existed": target.exists()}
     if reloc:
         where = "、".join(f"{k}={v}" for k, v in roots.items() if v)
     else:
@@ -1122,6 +1286,7 @@ def restore_slot(cfg: dict, root: Path, kind: str, slot_id: str, *,
                         "files": 0,
                         "expectFiles": int(p.get("sourceFiles", 0)),
                         "filesMatch": False,
+                        "returnCode": res_pack.code if res_pack else None,
                         "bytes": 0,
                         "seconds": 0.0,
                     }
@@ -1149,14 +1314,19 @@ def restore_slot(cfg: dict, root: Path, kind: str, slot_id: str, *,
             res = sevenzip.extract_7z(cfg, p["zipPath"], target, on_progress=prog)
 
         got_files, got_bytes = count_tree(target, [])
+        expected_files = int(p.get("archiveFiles", p.get("sourceFiles", 0)) or 0)
+        extract_error = res.error or (res.tail_text[-400:] if not res.ok else "")
         restored.append(
             {
                 "label": p["label"],
                 "dir": str(target),
                 "ok": res.ok,
                 "files": got_files,
-                "expectFiles": int(p.get("sourceFiles", 0)),
-                "filesMatch": got_files == int(p.get("sourceFiles", 0)),
+                "expectFiles": expected_files,
+                "sourceFiles": int(p.get("sourceFiles", 0)),
+                "filesMatch": got_files == expected_files,
+                "returnCode": res.code,
+                "error": extract_error,
                 "bytes": got_bytes,
                 "seconds": round(res.seconds, 1),
             }
@@ -1198,12 +1368,33 @@ def restore_slot(cfg: dict, root: Path, kind: str, slot_id: str, *,
     failed_links: list[str] = []
     pending_links: list[dict] = []
     dep_links = 0
+    explicit_link_keys = {
+        os.path.normcase(os.path.abspath(str(path)))
+        for path in cfgmod.resolve_exclude_links(cfg, kind)
+    }
     for l in links:
         link = Path(l["link"])
         tgt = l["target"]
         if reloc:
+            explicit_link = os.path.normcase(os.path.abspath(str(link))) in explicit_link_keys
             moved = _relocate_path(str(link), cfg, kind, roots)
             tgt_moved = _relocate_path(tgt, cfg, kind, roots)
+            workspace_link = _relocate_path(
+                str(link), cfg, cfgmod.KIND_WORKSPACE, roots, only_kind=True
+            )
+            workspace_target = _relocate_path(
+                tgt, cfg, cfgmod.KIND_WORKSPACE, roots, only_kind=True
+            )
+            if explicit_link or workspace_link is not None or workspace_target is not None:
+                # 工作区与 Harness/.dsh 之间的手工联接不会由 pnpm install 重建，
+                # 配置中点名排除的联接也必须显式写入脚本；两端按部署根重定位。
+                pending_links.append({
+                    "link": str(moved) if moved is not None else str(link),
+                    "target": str(tgt_moved) if tgt_moved is not None else tgt,
+                    "note": "工作区联接已重定位" if moved is not None and tgt_moved is not None
+                            else "联接有一端在新环境根之外，跑脚本前先确认目标路径",
+                })
+                continue
             if tgt_moved is not None:
                 # 目标落在新根内部 = pnpm / workspace 装出来的依赖链接
                 # （node_modules → .pnpm，或 vendor 之间互链）。装依赖时全部会重建，
@@ -1255,11 +1446,61 @@ def restore_slot(cfg: dict, root: Path, kind: str, slot_id: str, *,
             failed_links.append(f"{link}: {exc}")
 
     ok = all(r["ok"] and r["filesMatch"] for r in restored)
+    issues = []
+    for part in restored:
+        if not part["ok"]:
+            detail = f"解压退出码 {part.get('returnCode')}"
+            if part.get("error"):
+                detail += f"：{part['error']}"
+            issues.append(f"{part['label']}：{detail}")
+        elif not part["filesMatch"]:
+            diff = int(part.get("expectFiles", 0)) - int(part.get("files", 0))
+            issues.append(
+                f"{part['label']}：实际解出 {part['files']:,} / 清单预期 "
+                f"{part['expectFiles']:,} 个文件（差 {diff:+,}）"
+            )
+    reason = "；".join(issues)
+    relocation_cleanup = None
+    if reloc and not ok:
+        removed: list[str] = []
+        cleanup_failures: list[str] = []
+        for item in relocation_targets.values():
+            target = item["path"]
+            if not target.exists():
+                continue
+            try:
+                if item["existed"]:
+                    # 部署开始前这个目录已确认为空；失败时清掉本次解出的内容，保留空目录。
+                    for child in list(target.iterdir()):
+                        if sevenzip.is_link(child):
+                            os.rmdir(child)
+                        elif child.is_dir():
+                            _force_rmtree(child)
+                        else:
+                            child.unlink()
+                else:
+                    _force_rmtree(target)
+                if item["existed"] and target.exists() and not any(target.iterdir()):
+                    removed.append(str(target))
+                elif not target.exists():
+                    removed.append(str(target))
+                else:
+                    cleanup_failures.append(str(target))
+            except OSError as exc:
+                cleanup_failures.append(f"{target}: {exc}")
+        relocation_cleanup = {
+            "ok": not cleanup_failures,
+            "removed": removed,
+            "failed": cleanup_failures,
+        }
+        if cleanup_failures:
+            suffix = "部署失败后的清理也未完成：" + "；".join(cleanup_failures)
+            reason = f"{reason}；{suffix}" if reason else suffix
 
     # 落到别处时不自动建 junction：目标全是写死的绝对路径，换机之后大概率不存在。
     # 写成一份 .cmd 放在新根旁边，人看一眼、改一行、跑一遍。
     links_script = ""
-    if reloc:
+    if reloc and ok:
         cands = [_role_new_root(kind, p["label"], roots) for p in parts]
         base = next((c for c in cands if c is not None), None)
         if base is None:
@@ -1303,7 +1544,9 @@ def restore_slot(cfg: dict, root: Path, kind: str, slot_id: str, *,
         "parts": restored,
         "files": sum(r["files"] for r in restored),
         "expectFiles": sum(r["expectFiles"] for r in restored),
+        "sourceFiles": sum(int(r.get("sourceFiles", 0)) for r in restored),
         "filesMatch": all(r["filesMatch"] for r in restored),
+        "reason": reason,
         "emptyDirsMade": made_empty,
         "links": {"restored": rebuilt, "failed": failed_links},
         "pendingLinks": pending_links,
@@ -1312,6 +1555,7 @@ def restore_slot(cfg: dict, root: Path, kind: str, slot_id: str, *,
         "rollback": rollback,
         "fallbacks": fallbacks,
         "rolledBack": rollback_res,
+        "relocationCleanup": relocation_cleanup,
         "seconds": round(sum(r["seconds"] for r in restored), 1),
     }
     # 落位到新目录时才做收尾：装依赖 → 建链接 → 写启动器 → 删脚本。
@@ -1319,7 +1563,7 @@ def restore_slot(cfg: dict, root: Path, kind: str, slot_id: str, *,
     if ok and reloc and auto_finish:
         try:
             finish_restore(cfg, out, do_install=auto_install, do_links=auto_links,
-                           cleanup=True, logger=logger, progress=progress)
+                           cleanup=True, backup_root=root, logger=logger, progress=progress)
         except Exception as exc:                                  # noqa: BLE001
             out["finish"] = {"error": f"{type(exc).__name__}: {exc}"}
             if logger:
@@ -1327,6 +1571,10 @@ def restore_slot(cfg: dict, root: Path, kind: str, slot_id: str, *,
     if logger:
         logger.info("restore_done", kind=kind, slot=slot_id, ok=ok,
                     mode=out["mode"], files=out["files"],
+                    expectFiles=out["expectFiles"], reason=reason,
+                    parts=[{key: part.get(key) for key in
+                            ("label", "ok", "files", "expectFiles", "filesMatch", "returnCode", "error")}
+                           for part in restored],
                     rolledBack=bool(rollback_res and rollback_res.get("ok")),
                     fallbacks=len(fallbacks))
     if progress:
@@ -1349,10 +1597,10 @@ def restore_slot(cfg: dict, root: Path, kind: str, slot_id: str, *,
                 extra += ("，链接已建好" if lnk.get("ok")
                           else f"，有 {lnk.get('failedLines')} 条链接没建成")
             progress.finish(
-                f"恢复完成：{out['files']:,}/{out['expectFiles']:,} 文件，"
+                (f"恢复完成：{out['files']:,}/{out['expectFiles']:,} 文件，"
                 f"目录联接（junction）{rebuilt} 条"
                 + ("" if not failed_links else f"（失败 {len(failed_links)}）")
-                + extra,
+                + extra) if ok else f"恢复未通过完整性校验：{reason or '请查看日志'}",
                 ok,
             )
     return out
@@ -1744,7 +1992,7 @@ def status_summary(cfg: dict, root: Path) -> dict:
 
 
 def due_kinds(cfg: dict, root: Path, now: datetime | None = None) -> list[str]:
-    """按配置判断现在该跑哪些（sessions 看间隔，baseline 看每日时刻）。"""
+    """会话按间隔、基线按每日时刻；store 在新基线完成后增量跟进。"""
     now = now or datetime.now()
     now_ms = int(now.timestamp() * 1000)
     due: list[str] = []
@@ -1764,6 +2012,14 @@ def due_kinds(cfg: dict, root: Path, now: datetime | None = None) -> list[str]:
         slot_today = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if now >= slot_today and (not last or last["createdAt"] < slot_today.timestamp() * 1000):
             due.append(cfgmod.KIND_BASELINE)
+
+    store_cfg = k.get(cfgmod.KIND_STORE) or {}
+    if store_cfg.get("enabled") and store_cfg.get("follow_baseline"):
+        baseline = manifest.newest(root, cfgmod.KIND_BASELINE)
+        mirror = manifest.read_mirror_state(root)
+        if baseline and (not mirror.get("ok") or
+                         int(mirror.get("syncedAt") or 0) < int(baseline.get("createdAt") or 0)):
+            due.append(cfgmod.KIND_STORE)
     return due
 
 

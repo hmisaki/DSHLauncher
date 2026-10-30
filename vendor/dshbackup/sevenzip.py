@@ -147,6 +147,8 @@ def pack_7z(
 
     cmd.extend(str(a) for a in cfg.get("compress", {}).get("extra_args", []))
 
+    # 7-Zip 返回 1 表示“有警告”，通常是某些文件没能读取。归档本身仍可能通过
+    # `7z t`，但这不代表源目录的所有文件都进了包；备份必须把警告当失败处理。
     res = _run(cmd, cwd=source_root, pct_re=_PCT_7Z, on_progress=on_progress, ok_codes={0})
     if res.ok and Path(tmp).exists():
         os.replace(tmp, out_archive)
@@ -196,6 +198,7 @@ def pack_7z_multi(
     cmd.extend(str(Path(s["path"]).resolve()) for s in sources)
 
     # 多源必须给 cwd=None：给 cwd 会让 7z 只收当前目录下的相对路径，绝对路径反而进不去
+    # 多源压缩同样不能把“部分文件跳过”的警告认作成功。
     res = _run(cmd, cwd=None, pct_re=_PCT_7Z, on_progress=on_progress, ok_codes={0})
     if res.ok and Path(tmp).exists():
         os.replace(tmp, out_archive)
@@ -249,18 +252,27 @@ def list_7z(cfg: dict, archive: str | Path) -> list[str]:
 
 
 def archive_info(cfg: dict, archive: str | Path) -> dict:
-    """从 7z l 的尾部统计读条目数与总大小。"""
+    """从 7z l 尾部读出实际文件数，供备份与清单交叉校验。"""
     cmd = [seven_zip_path(cfg), "l", str(Path(archive).resolve())]
     res = _run(cmd, cwd=None, pct_re=_PCT_7Z, on_progress=None, ok_codes={0})
-    files = 0
-    size = 0
-    for line in res.tail:
-        s = line.strip()
-        if s.startswith("Files:"):
-            m = re.search(r"(\d+)\s+files", s)
-        if re.match(r"^\d{4}-\d{2}-\d{2}", s):
-            files += 1
-    return {"files": files, "ok": res.ok}
+    files: int | None = None
+    folders: int | None = None
+    # 7-Zip 26 prints a final summary such as "41372 files, 4106 folders".
+    # It is within _run's retained tail even when the archive has tens of thousands
+    # of entries. Older code counted dated listing rows, which mixed files and dirs.
+    for line in reversed(res.tail):
+        match = re.search(r"(\d[\d,]*)\s+files?,\s*(\d[\d,]*)\s+folders?", line, re.I)
+        if match:
+            files = int(match.group(1).replace(",", ""))
+            folders = int(match.group(2).replace(",", ""))
+            break
+    return {
+        "files": files,
+        "folders": folders,
+        "ok": res.ok and files is not None,
+        "code": res.code,
+        "error": res.error or ("\n".join(res.tail[-8:]) if files is None else ""),
+    }
 
 
 # ---------------- robocopy ----------------
@@ -325,7 +337,7 @@ def scan_links(
                     for e in it:
                         p = Path(e.path)
                         key = os.path.normcase(os.path.abspath(p))
-                        if key in excl or key in skip:
+                        if key in excl:
                             continue
                         try:
                             if e.is_symlink() or e.is_junction():
@@ -337,6 +349,10 @@ def scan_links(
                                 out.append(
                                     {"link": str(p), "target": target, "root": root["label"]}
                                 )
+                                continue
+                            if key in skip:
+                                # 显式排除的普通目录不递归；若它是链接，上面仍保留目标，
+                                # 恢复到新环境时才能把 junction 指向新根。
                                 continue
                             if e.is_dir(follow_symlinks=False):
                                 stack.append(p)
@@ -391,6 +407,8 @@ def dir_size(path: str | Path) -> tuple[int, int]:
         dirnames[:] = [d for d in dirnames if not is_link(Path(cur) / d)]
         for f in filenames:
             fp = Path(cur) / f
+            if is_link(fp):
+                continue
             try:
                 files += 1
                 size += fp.stat(follow_symlinks=False).st_size

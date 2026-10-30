@@ -1,1 +1,1 @@
-"""PySide6 桌面层。"""
+"""DSHLuncher 2 desktop application."""
